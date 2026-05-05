@@ -124,16 +124,34 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
             if (licenseData.hwid && licenseData.hwid !== hwid) return res.status(401).json({ code: "HWID_MISMATCH", error: "Key này đã được kích hoạt cho một máy tính khác." });
             if (!licenseData.hwid) await ref.update({ hwid: hwid });
 
+            // 4. Check Max Devices (Mặc định là 1 nếu DB không khai báo)
             const maxDevices = licenseData.maxDevices || 1;
             const sessionsRef = admin.database().ref('sessions');
             const sessionsSnap = await sessionsRef.orderByChild('licenseKey').equalTo(licenseKey).once('value');
             
             let activeSessions = 0;
             const now = Date.now();
+            const updates = {}; // Danh sách các phiên ảo cần dọn dẹp
+
             sessionsSnap.forEach(child => {
-                if (child.val().status === "active" && (now - child.val().lastPing < 10 * 60 * 1000)) activeSessions++;
+                const session = child.val();
+                
+                // 🔥 NẾU CÙNG 1 MÁY (Trùng HWID): Tự động thu hồi phiên cũ đang bị treo do Crash
+                if (session.hwid === hwid && session.status === "active") {
+                    updates[`${child.key}/status`] = "revoked_by_crash"; 
+                }
+                // KHÁC MÁY: Đếm số lượng phiên đang hoạt động trong 10 phút qua
+                else if (session.status === "active" && (now - session.lastPing < 10 * 60 * 1000)) {
+                    activeSessions++;
+                }
             });
-            if (activeSessions >= maxDevices) return res.status(403).json({ code: "MAX_DEVICES_REACHED", error: "Tài khoản đã đạt giới hạn số máy đăng nhập." });
+
+            // Thực thi dọn dẹp các phiên ma trên Firebase
+            if (Object.keys(updates).length > 0) {
+                await sessionsRef.update(updates);
+            }
+
+            if (activeSessions >= maxDevices) return res.status(403).json({ code: "MAX_DEVICES_REACHED", error: "Tài khoản đã đạt giới hạn thiết bị đăng nhập cùng lúc." });
 
             const sessionId = crypto.randomUUID();
             await sessionsRef.child(sessionId).set({
