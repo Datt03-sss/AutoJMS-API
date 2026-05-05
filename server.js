@@ -180,7 +180,8 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
                 payload: accessToken, 
                 sid: sessionId, 
                 cfg: { 
-                    dataSpreadsheetId: licenseData.dataSpreadsheetId || "" 
+                    dataSpreadsheetId: licenseData.dataSpreadsheetId || "",
+                    updateXmlUrl: process.env.UPDATE_XML_URL || "https://raw.githubusercontent.com/Datt03-sss/AutoJMS-Update/main/update.xml"
                 } 
             });
          
