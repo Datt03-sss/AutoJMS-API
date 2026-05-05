@@ -146,7 +146,7 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
                 }
             });
 
-            // Thực thi dọn dẹp các phiên ma trên Firebase
+            // Thực thi dọn dẹp các phiên thừa trên Firebase
             if (Object.keys(updates).length > 0) {
                 await sessionsRef.update(updates);
             }
@@ -162,6 +162,7 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
                 status: "active"
             });
 
+            // Sign JWT Strict
             const jti = crypto.randomUUID();
             const accessToken = jwt.sign(
                 { key: licenseKey, hwid: hwid, sid: sessionId, jti: jti }, 
@@ -169,7 +170,18 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
                 { algorithm: 'RS256', expiresIn: '15m', issuer: CONFIG.JWT_ISSUER, audience: CONFIG.JWT_AUDIENCE }
             );
 
-            return res.json({ payload: accessToken, sid: sessionId, cfg: licenseData.appConfig });
+            // ==========================================
+            // 🔥 SỬA DÒNG NÀY: PHẢI CÓ TRƯỜNG "cfg"
+            // ==========================================
+            return res.json({ 
+                payload: accessToken, 
+                sid: sessionId, 
+                cfg: { 
+                    dataSpreadsheetId: licenseData.dataSpreadsheetId || "" 
+                } 
+            });
+            // ==========================================
+
         } finally {
             await lockRef.remove(); 
         }
