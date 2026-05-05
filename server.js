@@ -172,7 +172,7 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
                     expiresIn: '15m', 
                     issuer: CONFIG.JWT_ISSUER, 
                     audience: CONFIG.JWT_AUDIENCE,
-                    keyid: "autojms-key-1"
+                    keyid: "accessKey"
                 }
             );
 
