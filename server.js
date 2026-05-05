@@ -167,7 +167,13 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
             const accessToken = jwt.sign(
                 { key: licenseKey, hwid: hwid, sid: sessionId, jti: jti }, 
                 CONFIG.JWT_PRIVATE, 
-                { algorithm: 'RS256', expiresIn: '15m', issuer: CONFIG.JWT_ISSUER, audience: CONFIG.JWT_AUDIENCE }
+                { 
+                    algorithm: 'RS256', 
+                    expiresIn: '15m', 
+                    issuer: CONFIG.JWT_ISSUER, 
+                    audience: CONFIG.JWT_AUDIENCE,
+                    keyid: "autojms-key-1"
+                }
             );
 
             return res.json({ 
