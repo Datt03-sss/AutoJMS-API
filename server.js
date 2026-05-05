@@ -254,6 +254,8 @@ app.use((err, req, res, next) => {
     const status = err.status || 500;
     res.status(status).json({ code: "SERVER_ERROR", error: "Lỗi kết nối CSDL: " + err.message });
 });
+const token = jwt.sign({ test: 1 }, PRIVATE, { algorithm: "RS256" });
+jwt.verify(token, PUBLIC);
 
 // ==========================================
 // 🔵 6. KHỞI ĐỘNG SERVER
