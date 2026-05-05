@@ -100,32 +100,30 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
     try {
         const { licenseKey, hwid, exeHash } = req.body;
         
-        // Input Validation & Sanitization
-        if (!sanitizeInput(licenseKey, hwid)) return res.status(400).json({ code: "INVALID_INPUT" });
+        // Bổ sung thêm error để C# đọc được
+        if (!sanitizeInput(licenseKey, hwid)) return res.status(400).json({ code: "INVALID_INPUT", error: "Định dạng Key không hợp lệ (Phải từ 5-50 ký tự)." });
 
-        // Integrity Check
         if (VALID_EXE_HASHES.length > 0 && (!exeHash || !VALID_EXE_HASHES.includes(exeHash.toLowerCase()))) {
-            return res.status(401).json({ code: "CLIENT_MODIFIED", error: "Phiên bản không hợp lệ." });
+            return res.status(401).json({ code: "CLIENT_MODIFIED", error: "Phiên bản phần mềm không hợp lệ hoặc đã bị can thiệp." });
         }
 
-        // Session Locking (Chống Spam / Race Condition)
         const lockRef = admin.database().ref(`locks/${licenseKey}`);
         const { committed } = await lockRef.transaction((curr) => (curr === null || Date.now() - curr.lockedAt > 5000) ? { lockedAt: admin.database.ServerValue.TIMESTAMP } : undefined);
-        if (!committed) return res.status(429).json({ code: "SYSTEM_BUSY" });
+        if (!committed) return res.status(429).json({ code: "SYSTEM_BUSY", error: "Hệ thống đang bận, vui lòng thử lại sau 5 giây." });
 
         try {
             const ref = admin.database().ref(`licenses/${licenseKey}`);
             const snapshot = await ref.once('value');
             const licenseData = snapshot.val();
 
-            if (!licenseData || licenseData.isActive === false) return res.status(401).json({ code: "LICENSE_INVALID" });
-            if (new Date(licenseData.expireDate) < new Date()) return res.status(401).json({ code: "LICENSE_EXPIRED" });
+            // Sửa lại các dòng này: Thêm error
+            if (!licenseData) return res.status(401).json({ code: "LICENSE_NOT_FOUND", error: "Key này không tồn tại trên hệ thống!" });
+            if (licenseData.isActive === false) return res.status(401).json({ code: "LICENSE_DISABLED", error: "Key đã bị Admin khóa." });
+            if (new Date(licenseData.expireDate) < new Date()) return res.status(401).json({ code: "LICENSE_EXPIRED", error: "Key đã hết hạn sử dụng." });
             
-            // Bind chặt HWID
-            if (licenseData.hwid && licenseData.hwid !== hwid) return res.status(401).json({ code: "HWID_MISMATCH" });
+            if (licenseData.hwid && licenseData.hwid !== hwid) return res.status(401).json({ code: "HWID_MISMATCH", error: "Key này đã được kích hoạt cho một máy tính khác." });
             if (!licenseData.hwid) await ref.update({ hwid: hwid });
 
-            // Check Max Devices
             const maxDevices = licenseData.maxDevices || 1;
             const sessionsRef = admin.database().ref('sessions');
             const sessionsSnap = await sessionsRef.orderByChild('licenseKey').equalTo(licenseKey).once('value');
@@ -135,9 +133,8 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
             sessionsSnap.forEach(child => {
                 if (child.val().status === "active" && (now - child.val().lastPing < 10 * 60 * 1000)) activeSessions++;
             });
-            if (activeSessions >= maxDevices) return res.status(403).json({ code: "MAX_DEVICES_REACHED" });
+            if (activeSessions >= maxDevices) return res.status(403).json({ code: "MAX_DEVICES_REACHED", error: "Tài khoản đã đạt giới hạn số máy đăng nhập." });
 
-            // Create Session
             const sessionId = crypto.randomUUID();
             await sessionsRef.child(sessionId).set({
                 licenseKey: licenseKey,
@@ -147,7 +144,6 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
                 status: "active"
             });
 
-            // Sign JWT Strict
             const jti = crypto.randomUUID();
             const accessToken = jwt.sign(
                 { key: licenseKey, hwid: hwid, sid: sessionId, jti: jti }, 
@@ -159,7 +155,10 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
         } finally {
             await lockRef.remove(); 
         }
-    } catch (error) { next(error); }
+    } catch (error) { 
+        console.error("Lỗi Verify:", error); // In ra log Render để debug
+        next(error); 
+    }
 });
 
 // [API 2]: DUY TRÌ SỰ SỐNG (HEARTBEAT)
@@ -217,12 +216,13 @@ app.post('/api/heartbeat', async (req, res, next) => {
 
 // --- ERROR HANDLING MIDDLEWARE ---
 app.use((err, req, res, next) => {
+    console.error("[SERVER ERROR]", err); // In ra log Render
     const status = err.status || 500;
-    res.status(status).json({ code: "SERVER_ERROR", message: "Đã xảy ra sự cố ngầm trên máy chủ." });
+    res.status(status).json({ code: "SERVER_ERROR", error: "Lỗi kết nối CSDL: " + err.message });
 });
 
 // ==========================================
 // 🔵 6. KHỞI ĐỘNG SERVER
 // ==========================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 AutoJMS Enterprise Gateway is running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 AutoJMS Server is running on port ${PORT}`));
