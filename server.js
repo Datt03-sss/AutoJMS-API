@@ -112,7 +112,7 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
         if (!committed) return res.status(429).json({ code: "SYSTEM_BUSY", error: "Hệ thống đang bận, vui lòng thử lại sau 5 giây." });
 
         try {
-            const ref = admin.database().ref(`licenses/${licenseKey}`);
+            const ref = admin.database().ref(`Licenses/${licenseKey}`);
             const snapshot = await ref.once('value');
             const licenseData = snapshot.val();
 
