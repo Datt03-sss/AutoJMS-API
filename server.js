@@ -170,9 +170,6 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
                 { algorithm: 'RS256', expiresIn: '15m', issuer: CONFIG.JWT_ISSUER, audience: CONFIG.JWT_AUDIENCE }
             );
 
-            // ==========================================
-            // 🔥 SỬA DÒNG NÀY: PHẢI CÓ TRƯỜNG "cfg"
-            // ==========================================
             return res.json({ 
                 payload: accessToken, 
                 sid: sessionId, 
@@ -180,7 +177,7 @@ app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
                     dataSpreadsheetId: licenseData.dataSpreadsheetId || "" 
                 } 
             });
-            // ==========================================
+         
 
         } finally {
             await lockRef.remove(); 
