@@ -4,7 +4,42 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 const NodeCache = require('node-cache');
+const helmet = require('helmet');
+const cors = require('cors');
 
+// ==========================================
+// 🔴 1. GLOBAL ERROR HANDLERS (Chống chết ngầm)
+// ==========================================
+process.on("uncaughtException", err => {
+    console.error("[FATAL] Uncaught Exception:", err);
+    // Ghi log vào file hoặc monitor service ở đây
+});
+process.on("unhandledRejection", reason => {
+    console.error("[FATAL] Unhandled Rejection:", reason);
+});
+
+// ==========================================
+// 🔴 2. ENV VALIDATION (Fail-fast chống Crash)
+// ==========================================
+const requiredEnv = ["JWT_PUBLIC_KEY", "JWT_PRIVATE_KEY"];
+requiredEnv.forEach(key => {
+    if (!process.env[key]) {
+        console.error(`❌ CRITICAL ERROR: Missing ENV variable: ${key}`);
+        process.exit(1); // Ép Server dừng ngay lập tức nếu thiếu Key
+    }
+});
+
+const formatKey = (key) => key.replace(/\\n/g, '\n');
+const CONFIG = {
+    JWT_PUBLIC: formatKey(process.env.JWT_PUBLIC_KEY),
+    JWT_PRIVATE: formatKey(process.env.JWT_PRIVATE_KEY),
+    JWT_ISSUER: "autojms-license-server",
+    JWT_AUDIENCE: "autojms-desktop-client"
+};
+
+// ==========================================
+// 🟠 3. KHỞI TẠO SERVICES
+// ==========================================
 const serviceAccount = require('./serviceAccountKey.json');
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -12,66 +47,85 @@ admin.initializeApp({
 });
 
 const app = express();
-app.use(express.json());
 
-const JWT_PRIVATE_KEY = process.env.JWT_PRIVATE_KEY.replace(/\\n/g, '\n');
-const JWT_PUBLIC_KEY = process.env.JWT_PUBLIC_KEY.replace(/\\n/g, '\n');
+// --- BẢO VỆ TẦNG NETWORK & HTTP ---
+app.set('trust proxy', 1); // ⚠️ Rất quan trọng khi host trên Render/Heroku để Rate Limit hoạt động
+app.disable("x-powered-by"); // Giấu thông tin Express
+app.use(helmet()); // Thêm các Header bảo mật HTTP
+app.use(cors()); // Cấu hình CORS nếu cần gọi từ Web (hiện tại cho phép tất cả)
+app.use(express.json({ limit: "10kb" })); // Chống Payload quá khổ gây tràn RAM
 
-// ĐỌC DANH SÁCH MÃ HASH HỢP LỆ TỪ BIẾN MÔI TRƯỜNG RENDER
-// Ví dụ trên Render bạn điền: VALID_EXE_HASHES = "hash1,hash2"
-const validHashesString = process.env.VALID_EXE_HASHES || "";
-const VALID_EXE_HASHES = validHashesString.split(',').map(h => h.trim().toLowerCase());
-
-const verifyLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, message: { code: "RATE_LIMIT_EXCEEDED" } });
-const jtiCache = new NodeCache({ stdTTL: 900, checkperiod: 120 });
-
-setInterval(async () => {
-    // Dọn rác Session
-    try {
-        const cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000); 
-        const sessionsRef = admin.database().ref('sessions');
-        const snapshot = await sessionsRef.orderByChild('lastPing').endAt(cutoff).once('value');
-        const updates = {};
-        snapshot.forEach(child => { updates[child.key] = null; });
-        if (Object.keys(updates).length > 0) await sessionsRef.update(updates);
-    } catch (e) { }
-}, 12 * 60 * 60 * 1000);
+// --- MIDDLEWARE: TIMEOUT (Chống treo Server) ---
+app.use((req, res, next) => {
+    req.setTimeout(5000, () => {
+        const err = new Error('Request Timeout');
+        err.status = 408;
+        next(err);
+    });
+    res.setTimeout(5000, () => {
+        const err = new Error('Service Unavailable');
+        err.status = 503;
+        next(err);
+    });
+    next();
+});
 
 // ==========================================
-// 🔐 API 1: VERIFY LICENSE
+// 🟡 4. CACHE & RATE LIMIT
 // ==========================================
-app.post('/api/verify-license', verifyLimiter, async (req, res) => {
+const jtiCache = new NodeCache({ stdTTL: 900, checkperiod: 120 }); // Lưu JTI chống Replay Attack
+
+const verifyLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 10,
+    message: { code: "RATE_LIMIT_EXCEEDED", error: "Thao tác quá nhanh, vui lòng chậm lại." }
+});
+
+// Đọc danh sách Hash từ cấu hình (Anti-Tamper)
+const VALID_EXE_HASHES = (process.env.VALID_EXE_HASHES || "").split(',').filter(Boolean).map(h => h.trim().toLowerCase());
+
+// ==========================================
+// 🟢 5. API ENDPOINTS
+// ==========================================
+
+// --- VALIDATION HELPER ---
+const sanitizeInput = (key, hwid) => {
+    if (typeof key !== "string" || key.length > 50 || key.length < 5) return false;
+    if (typeof hwid !== "string" || hwid.length > 150 || hwid.length < 10) return false;
+    return true;
+};
+
+// [API 1]: ĐĂNG NHẬP (VERIFY)
+app.post('/api/verify-license', verifyLimiter, async (req, res, next) => {
     try {
         const { licenseKey, hwid, exeHash } = req.body;
-        if (!licenseKey || !hwid) return res.status(400).json({ code: "BAD_REQUEST" });
+        
+        // Input Validation & Sanitization
+        if (!sanitizeInput(licenseKey, hwid)) return res.status(400).json({ code: "INVALID_INPUT" });
 
-        // 🔥 KIỂM TRA MÃ BĂM PHẦN MỀM (INTEGRITY CHECK) 🔥
-        if (VALID_EXE_HASHES.length > 0 && !VALID_EXE_HASHES.includes(exeHash?.toLowerCase())) {
-            return res.status(401).json({ 
-                code: "CLIENT_MODIFIED", 
-                error: "Phiên bản phần mềm không hợp lệ, đã bị chỉnh sửa hoặc cần được cập nhật!" 
-            });
+        // Integrity Check
+        if (VALID_EXE_HASHES.length > 0 && (!exeHash || !VALID_EXE_HASHES.includes(exeHash.toLowerCase()))) {
+            return res.status(401).json({ code: "CLIENT_MODIFIED", error: "Phiên bản không hợp lệ." });
         }
 
+        // Session Locking (Chống Spam / Race Condition)
         const lockRef = admin.database().ref(`locks/${licenseKey}`);
-        const { committed } = await lockRef.transaction((currentData) => {
-            if (currentData === null || Date.now() - currentData.lockedAt > 5000) return { lockedAt: admin.database.ServerValue.TIMESTAMP };
-            return; 
-        });
-
-        if (!committed) return res.status(429).json({ code: "SYSTEM_BUSY", error: "Hệ thống đang bận." });
+        const { committed } = await lockRef.transaction((curr) => (curr === null || Date.now() - curr.lockedAt > 5000) ? { lockedAt: admin.database.ServerValue.TIMESTAMP } : undefined);
+        if (!committed) return res.status(429).json({ code: "SYSTEM_BUSY" });
 
         try {
             const ref = admin.database().ref(`licenses/${licenseKey}`);
             const snapshot = await ref.once('value');
             const licenseData = snapshot.val();
 
-            if (!licenseData || licenseData.isActive === false) return res.status(401).json({ code: "LICENSE_INVALID", error: "Key không hợp lệ hoặc bị khóa." });
-            if (new Date(licenseData.expireDate) < new Date()) return res.status(401).json({ code: "LICENSE_EXPIRED", error: "Key đã hết hạn." });
-            if (licenseData.hwid && licenseData.hwid !== hwid) return res.status(401).json({ code: "HWID_MISMATCH", error: "Key này đã dùng cho máy khác." });
+            if (!licenseData || licenseData.isActive === false) return res.status(401).json({ code: "LICENSE_INVALID" });
+            if (new Date(licenseData.expireDate) < new Date()) return res.status(401).json({ code: "LICENSE_EXPIRED" });
             
+            // Bind chặt HWID
+            if (licenseData.hwid && licenseData.hwid !== hwid) return res.status(401).json({ code: "HWID_MISMATCH" });
             if (!licenseData.hwid) await ref.update({ hwid: hwid });
 
+            // Check Max Devices
             const maxDevices = licenseData.maxDevices || 1;
             const sessionsRef = admin.database().ref('sessions');
             const sessionsSnap = await sessionsRef.orderByChild('licenseKey').equalTo(licenseKey).once('value');
@@ -79,12 +133,11 @@ app.post('/api/verify-license', verifyLimiter, async (req, res) => {
             let activeSessions = 0;
             const now = Date.now();
             sessionsSnap.forEach(child => {
-                const sData = child.val();
-                if (sData.status === "active" && (now - sData.lastPing < 10 * 60 * 1000)) activeSessions++;
+                if (child.val().status === "active" && (now - child.val().lastPing < 10 * 60 * 1000)) activeSessions++;
             });
+            if (activeSessions >= maxDevices) return res.status(403).json({ code: "MAX_DEVICES_REACHED" });
 
-            if (activeSessions >= maxDevices) return res.status(403).json({ code: "MAX_DEVICES_REACHED", error: "Quá giới hạn số lượng thiết bị." });
-
+            // Create Session
             const sessionId = crypto.randomUUID();
             await sessionsRef.child(sessionId).set({
                 licenseKey: licenseKey,
@@ -94,24 +147,23 @@ app.post('/api/verify-license', verifyLimiter, async (req, res) => {
                 status: "active"
             });
 
+            // Sign JWT Strict
             const jti = crypto.randomUUID();
             const accessToken = jwt.sign(
                 { key: licenseKey, hwid: hwid, sid: sessionId, jti: jti }, 
-                JWT_PRIVATE_KEY, 
-                { algorithm: 'RS256', expiresIn: '15m' }
+                CONFIG.JWT_PRIVATE, 
+                { algorithm: 'RS256', expiresIn: '15m', issuer: CONFIG.JWT_ISSUER, audience: CONFIG.JWT_AUDIENCE }
             );
 
             return res.json({ payload: accessToken, sid: sessionId, cfg: licenseData.appConfig });
         } finally {
             await lockRef.remove(); 
         }
-    } catch (error) { return res.status(500).json({ code: "INTERNAL_ERROR" }); }
+    } catch (error) { next(error); }
 });
 
-// ==========================================
-// ❤️ API 2: HEARTBEAT
-// ==========================================
-app.post('/api/heartbeat', async (req, res) => {
+// [API 2]: DUY TRÌ SỰ SỐNG (HEARTBEAT)
+app.post('/api/heartbeat', async (req, res, next) => {
     try {
         const authHeader = req.headers.authorization;
         if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ action: "kill", code: "MISSING_TOKEN" });
@@ -119,42 +171,58 @@ app.post('/api/heartbeat', async (req, res) => {
         const token = authHeader.split(' ')[1];
         let decoded;
         try {
-            decoded = jwt.verify(token, JWT_PUBLIC_KEY, { algorithms: ['RS256'] });
+            decoded = jwt.verify(token, CONFIG.JWT_PUBLIC, { 
+                algorithms: ['RS256'],
+                issuer: CONFIG.JWT_ISSUER,
+                audience: CONFIG.JWT_AUDIENCE
+            });
         } catch (err) {
             return res.status(401).json({ action: "kill", code: "INVALID_TOKEN" });
         }
 
+        // Anti-Replay Attack Check
         if (jtiCache.has(decoded.jti)) return res.status(401).json({ action: "kill", code: "TOKEN_REUSED" });
         jtiCache.set(decoded.jti, true);
 
-        const { sid, key, hwid } = decoded;
         const { clientHwid, exeHash } = req.body;
+        
+        // Input Validation
+        if (typeof clientHwid !== "string" || clientHwid.length < 10) return res.status(400).json({ action: "kill", code: "INVALID_INPUT" });
 
-        // 🔥 KIỂM TRA MÃ BĂM PHẦN MỀM TRONG LÚC CHẠY (Chống đổi file khi đang chạy) 🔥
-        if (VALID_EXE_HASHES.length > 0 && !VALID_EXE_HASHES.includes(exeHash?.toLowerCase())) {
-            return res.status(401).json({ action: "kill", reason: "Phát hiện mã nguồn bị can thiệp!" });
+        // Integrity Check
+        if (VALID_EXE_HASHES.length > 0 && (!exeHash || !VALID_EXE_HASHES.includes(exeHash.toLowerCase()))) {
+            return res.status(401).json({ action: "kill", code: "CLIENT_MODIFIED" });
         }
 
-        if (clientHwid !== hwid) return res.status(401).json({ action: "kill", code: "HWID_FORGED", reason: "Sai định danh phần cứng!" });
+        if (clientHwid !== decoded.hwid) return res.status(401).json({ action: "kill", code: "HWID_FORGED" });
 
-        const sessionRef = admin.database().ref(`sessions/${sid}`);
+        const sessionRef = admin.database().ref(`sessions/${decoded.sid}`);
         const sessionSnap = await sessionRef.once('value');
         const sessionData = sessionSnap.val();
 
-        if (!sessionData || sessionData.status !== "active") return res.status(401).json({ action: "kill", code: "SESSION_REVOKED", reason: "Session đã bị ngắt!" });
+        if (!sessionData || sessionData.status !== "active") return res.status(401).json({ action: "kill", code: "SESSION_REVOKED" });
 
         await sessionRef.update({ lastPing: admin.database.ServerValue.TIMESTAMP });
 
         const newJti = crypto.randomUUID();
         const newAccessToken = jwt.sign(
-            { key: key, hwid: hwid, sid: sid, jti: newJti }, 
-            JWT_PRIVATE_KEY, 
-            { algorithm: 'RS256', expiresIn: '15m' }
+            { key: decoded.key, hwid: decoded.hwid, sid: decoded.sid, jti: newJti }, 
+            CONFIG.JWT_PRIVATE, 
+            { algorithm: 'RS256', expiresIn: '15m', issuer: CONFIG.JWT_ISSUER, audience: CONFIG.JWT_AUDIENCE }
         );
 
         return res.json({ action: "continue", payload: newAccessToken });
-    } catch (error) { return res.status(500).json({ code: "INTERNAL_ERROR" }); }
+    } catch (error) { next(error); }
 });
 
+// --- ERROR HANDLING MIDDLEWARE ---
+app.use((err, req, res, next) => {
+    const status = err.status || 500;
+    res.status(status).json({ code: "SERVER_ERROR", message: "Đã xảy ra sự cố ngầm trên máy chủ." });
+});
+
+// ==========================================
+// 🔵 6. KHỞI ĐỘNG SERVER
+// ==========================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`AutoJMS Secure is running`));
+app.listen(PORT, () => console.log(`🚀 AutoJMS Enterprise Gateway is running on port ${PORT}`));
