@@ -21,8 +21,12 @@ if (!process.env.JWT_PRIVATE_KEY || !process.env.JWT_PUBLIC_KEY) {
     process.exit(1);
 }
 
-// Xử lý lỗi xuống dòng khi copy Key từ Render
-const formatKey = (k) => k.replace(/\\n/g, '\n');
+// Xóa dấu ngoặc kép thừa (nếu có trên Render) và fix lỗi xuống dòng
+const formatKey = (k) => {
+    if (!k) return '';
+    let key = k.replace(/^"|"$/g, ''); // Cắt sạch ngoặc kép ở 2 đầu
+    return key.replace(/\\n/g, '\n');  // Trả lại đúng định dạng xuống dòng
+};
 
 const CONFIG = {
     PRIVATE: formatKey(process.env.JWT_PRIVATE_KEY),
