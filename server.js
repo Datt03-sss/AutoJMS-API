@@ -21,11 +21,10 @@ if (!process.env.JWT_PRIVATE_KEY || !process.env.JWT_PUBLIC_KEY) {
     process.exit(1);
 }
 
-// Xóa dấu ngoặc kép thừa (nếu có trên Render) và fix lỗi xuống dòng
 const formatKey = (k) => {
     if (!k) return '';
-    let key = k.replace(/^"|"$/g, ''); // Cắt sạch ngoặc kép ở 2 đầu
-    return key.replace(/\\n/g, '\n');  // Trả lại đúng định dạng xuống dòng
+    let key = k.replace(/^"|"$/g, '');
+    return key.replace(/\\n/g, '\n');
 };
 
 const CONFIG = {
@@ -33,7 +32,6 @@ const CONFIG = {
     PUBLIC: formatKey(process.env.JWT_PUBLIC_KEY),
     ISSUER: "autojms-license-server",
     AUDIENCE: "autojms-desktop-client",
-    // Ưu tiên lấy link từ biến môi trường của Render
     UPDATE_URL: process.env.UPDATE_XML_URL || "https://raw.githubusercontent.com/Datt03-sss/AutoJMS-Update/main/update.xml"
 };
 
@@ -56,8 +54,8 @@ app.use(express.json());
 // ==========================================
 // RATE LIMIT & CACHE
 // ==========================================
-const limiter = rateLimit({ windowMs: 60000, max: 20 }); // Cho phép 20 request/phút (Nới lỏng cho Heartbeat)
-const jtiCache = new NodeCache({ stdTTL: 900 });         // Lưu JTI trong 15 phút để chống Replay Attack
+const limiter = rateLimit({ windowMs: 60000, max: 20 }); 
+const jtiCache = new NodeCache({ stdTTL: 3600 });         
 
 // ==========================================
 // [API 1]: VERIFY LICENSE (ĐĂNG NHẬP)
@@ -70,15 +68,14 @@ app.post('/api/verify-license', limiter, async (req, res) => {
             return res.status(400).json({ error: "Vui lòng nhập Key." });
         }
 
-        // 1. ĐỌC DỮ LIỆU TỪ FIREBASE TRƯỚC TIÊN
+        // 1. ĐỌC DỮ LIỆU TỪ FIREBASE 
         const ref = admin.database().ref(`Licenses/${licenseKey}`);
         const snap = await ref.once('value');
         const data = snap.val();
 
         if (!data) return res.status(401).json({ error: "Key bản quyền không tồn tại hoặc không còn khả dụng." });
 
-        // 2. KIỂM TRA HASH 
-        // Nếu trên Firebase của Key này có set skipHashCheck: true thì bỏ qua check Hash
+        // 2. KIỂM TRA HASH (HỖ TRỢ BYPASS)
         const skipHash = data.skipHashCheck === true; 
 
         if (!skipHash) {
@@ -86,21 +83,19 @@ app.post('/api/verify-license', limiter, async (req, res) => {
             if (validHashesStr.trim() !== "") {
                 const validHashes = validHashesStr.split(',').map(h => h.trim().toLowerCase());
                 if (!exeHash || !validHashes.includes(exeHash.toLowerCase())) {
-                    console.warn(`[XÁC THỰC THẤT BẠI] Sai Hash trên Key: ${licenseKey}`);
-                    return res.status(403).json({ error: "Phát hiện phần mềm không nguyên bản hoặc phiên bản đã quá cũ. Vui lòng cập nhật bản mới nhất!" });
+                    console.warn(`[XÁC THỰC THẤT BẠI]`);
+                    return res.status(403).json({ error: "Phần mềm không nguyên bản hoặc phiên bản đã quá cũ. Vui lòng cập nhật bản mới nhất!" });
                 }
             }
         }
 
-        // 3. Kiểm tra khóa thiết bị (HWID Lock)
+        // 3. KIỂM TRA KHÓA THIẾT BỊ (HWID LOCK)
         if (data.hwid && data.hwid !== hwid)
             return res.status(401).json({ error: "Key này đang được sử dụng trên một máy tính khác." });
 
-        // Ghi nhận HWID nếu đây là lần đầu đăng nhập
         if (!data.hwid) await ref.update({ hwid });
 
-        /* ... CÁC PHẦN CODE KHÁC BÊN DƯỚI GIỮ NGUYÊN (Dọn rác, Ký JWT, Trả về client) ... */
-        // 2. CHỐNG KẸT PHIÊN (DỌN RÁC DO CRASH)
+        // 4. CHỐNG KẸT PHIÊN (DỌN RÁC DO CRASH)
         const sessionsRef = admin.database().ref('sessions');
         const sessionsSnap = await sessionsRef.orderByChild('licenseKey').equalTo(licenseKey).once('value');
         const updates = {};
@@ -116,7 +111,7 @@ app.post('/api/verify-license', limiter, async (req, res) => {
             await sessionsRef.update(updates);
         }
 
-        // 3. Tạo Session mới
+        // 5. TẠO SESSION MỚI
         const sessionId = crypto.randomUUID();
         await admin.database().ref(`sessions/${sessionId}`).set({
             licenseKey,
@@ -125,7 +120,7 @@ app.post('/api/verify-license', limiter, async (req, res) => {
             lastPing: Date.now()
         });
 
-        // 4. Ký JWT Token với đầy đủ thông tin định danh
+        // 6. KÝ JWT TOKEN
         const token = jwt.sign(
             {
                 key: licenseKey,
@@ -143,7 +138,7 @@ app.post('/api/verify-license', limiter, async (req, res) => {
             }
         );
 
-        // 5. Trả dữ liệu về cho C# (Bao gồm Token, SessionID và Config)
+        // 7. TRẢ DỮ LIỆU VỀ CLIENT
         return res.json({ 
             payload: token, 
             sid: sessionId,
@@ -236,4 +231,4 @@ app.post('/api/heartbeat', async (req, res) => {
 // START SERVER
 // ==========================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("🚀 Server Enterprise chạy trên Port:", PORT));
+app.listen(PORT, () => console.log("🚀 AutoJMS Server Running port:", PORT));
