@@ -67,22 +67,39 @@ app.post('/api/verify-license', limiter, async (req, res) => {
         const { licenseKey, hwid, exeHash } = req.body; 
 
         if (!licenseKey || !hwid) {
-            return res.status(400).json({ error: "Vui lòng nhập Key. Hệ thống không nhận diện được mã thiết bị." });
+            return res.status(400).json({ error: "Vui lòng nhập Key." });
         }
 
+        // 1. ĐỌC DỮ LIỆU TỪ FIREBASE TRƯỚC TIÊN
         const ref = admin.database().ref(`Licenses/${licenseKey}`);
         const snap = await ref.once('value');
         const data = snap.val();
 
-        if (!data) return res.status(401).json({ error: "Key bản quyền không tồn tại hoặc đã bị xóa." });
+        if (!data) return res.status(401).json({ error: "Key bản quyền không tồn tại hoặc không còn khả dụng." });
 
-        // 1. Kiểm tra khóa thiết bị (HWID Lock)
+        // 2. KIỂM TRA HASH 
+        // Nếu trên Firebase của Key này có set skipHashCheck: true thì bỏ qua check Hash
+        const skipHash = data.skipHashCheck === true; 
+
+        if (!skipHash) {
+            const validHashesStr = process.env.VALID_EXE_HASHES || "";
+            if (validHashesStr.trim() !== "") {
+                const validHashes = validHashesStr.split(',').map(h => h.trim().toLowerCase());
+                if (!exeHash || !validHashes.includes(exeHash.toLowerCase())) {
+                    console.warn(`[XÁC THỰC THẤT BẠI] Sai Hash trên Key: ${licenseKey}`);
+                    return res.status(403).json({ error: "Phát hiện phần mềm không nguyên bản hoặc phiên bản đã quá cũ. Vui lòng cập nhật bản mới nhất!" });
+                }
+            }
+        }
+
+        // 3. Kiểm tra khóa thiết bị (HWID Lock)
         if (data.hwid && data.hwid !== hwid)
             return res.status(401).json({ error: "Key này đang được sử dụng trên một máy tính khác." });
 
         // Ghi nhận HWID nếu đây là lần đầu đăng nhập
         if (!data.hwid) await ref.update({ hwid });
 
+        /* ... CÁC PHẦN CODE KHÁC BÊN DƯỚI GIỮ NGUYÊN (Dọn rác, Ký JWT, Trả về client) ... */
         // 2. CHỐNG KẸT PHIÊN (DỌN RÁC DO CRASH)
         const sessionsRef = admin.database().ref('sessions');
         const sessionsSnap = await sessionsRef.orderByChild('licenseKey').equalTo(licenseKey).once('value');
@@ -90,7 +107,6 @@ app.post('/api/verify-license', limiter, async (req, res) => {
         
         sessionsSnap.forEach(child => {
             const session = child.val();
-            // Nếu có phiên cũ mang cùng HWID, tiến hành xóa sạch (gán = null)
             if (session.hwid === hwid) {
                 updates[child.key] = null; 
             }
@@ -133,7 +149,7 @@ app.post('/api/verify-license', limiter, async (req, res) => {
             sid: sessionId,
             cfg: {
                 dataSpreadsheetId: data.dataSpreadsheetId || "",
-                updateXmlUrl: data.updateXmlUrl || CONFIG.UPDATE_URL // Ưu tiên link riêng lẻ, nếu không thì lấy mặc định
+                updateXmlUrl: data.updateXmlUrl || CONFIG.UPDATE_URL 
             }
         });
 
@@ -164,12 +180,12 @@ app.post('/api/heartbeat', async (req, res) => {
                 audience: CONFIG.AUDIENCE
             });
         } catch (err) {
-            return res.status(401).json({ action: "kill", reason: "Token đã hết hạn hoặc bị làm giả." });
+            return res.status(401).json({ action: "kill", reason: "Token đã hết hạn hoặc bị không khả dụng." });
         }
 
         // 2. Chống Replay Attack (Một Token chỉ được dùng 1 lần)
         if (jtiCache.has(decoded.jti)) {
-            return res.status(401).json({ action: "kill", reason: "Phát hiện nhân bản gói tin mạng (Replay Attack)." });
+            return res.status(401).json({ action: "kill", reason: "Phát hiện nhân bản gói tin mạng." });
         }
         jtiCache.set(decoded.jti, true);
 
@@ -212,7 +228,7 @@ app.post('/api/heartbeat', async (req, res) => {
 
     } catch (e) {
         console.error("Heartbeat Error:", e);
-        res.status(500).json({ action: "kill", reason: "Lỗi nội bộ hệ thống trong quá trình duy trì nhịp tim." });
+        res.status(500).json({ action: "kill", reason: "Lỗi nội bộ hệ thống trong quá trình duy trì ứng dụng." });
     }
 });
 
