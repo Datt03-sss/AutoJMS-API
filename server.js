@@ -140,13 +140,24 @@ app.post('/api/verify-license', limiter, async (req, res) => {
 
         // 7. TRẢ DỮ LIỆU VỀ CLIENT
         return res.json({ 
-            payload: token, 
-            sid: sessionId,
-            cfg: {
-                dataSpreadsheetId: data.dataSpreadsheetId || "",
-                updateXmlUrl: data.updateXmlUrl || CONFIG.UPDATE_URL 
-            }
-        });
+    payload: token,
+    sid: sessionId,
+
+    // LICENSE INFO
+    tier: data.tier || "BASE",
+
+    // INTEGRITY
+    skipHashCheck: data.skipHashCheck === true,
+
+    // MODULE UPDATE POLICY
+    modulePolicy: data.modulePolicy || {},
+
+    // CLIENT CONFIG
+    cfg: {
+        dataSpreadsheetId: data.dataSpreadsheetId || "",
+        updateXmlUrl: data.updateXmlUrl || CONFIG.UPDATE_URL
+    }
+});
 
     } catch (e) {
         console.error("Verify Error:", e);
