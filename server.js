@@ -256,20 +256,27 @@ app.post("/api/verify-license", limiter, async (req, res) => {
             tier
         });
 
+        const modulePolicy = data.modulePolicy || {
+            autoUpdate: true,
+            silentUpdate: true,
+            applyOnNextStartup: true
+        };
+        const middleCode = data.middleCode || "";
+
         return res.json({
             payload: token,
             sid: sessionId,
+            tier,
+            middleCode,
+            skipHashCheck,
+            modulePolicy,
 
             license: {
                 status: data.status || "active",
                 tier,
-                middleCode: data.middleCode || "",
+                middleCode,
                 skipHashCheck,
-                modulePolicy: data.modulePolicy || {
-                    autoUpdate: true,
-                    silentUpdate: true,
-                    applyOnNextStartup: true
-                }
+                modulePolicy
             },
 
             cfg: {
