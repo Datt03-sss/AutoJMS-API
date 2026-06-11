@@ -1,2 +1,10 @@
 node_modules/
 serviceAccountKey.json
+service_account.json
+firebase-adminsdk*.json
+*.firebase-adminsdk.json
+.env
+.env.*
+*.key
+*.pfx
+*.sec

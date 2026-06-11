@@ -61,12 +61,41 @@ const SUPABASE_MANIFESTS = {
 // ==========================================
 // FIREBASE INIT
 // ==========================================
-const serviceAccount = require("./serviceAccountKey.json");
+function loadFirebaseServiceAccountFromEnv() {
+    const base64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+
+    if (!base64 || !base64.trim()) {
+        throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_BASE64 in Environment Variables");
+    }
+
+    try {
+        const json = Buffer.from(base64, "base64").toString("utf8");
+        const serviceAccount = JSON.parse(json);
+
+        if (
+            !serviceAccount.project_id ||
+            !serviceAccount.client_email ||
+            !serviceAccount.private_key
+        ) {
+            throw new Error("Firebase service account env is missing required fields");
+        }
+
+        return serviceAccount;
+    } catch (err) {
+        throw new Error("Invalid FIREBASE_SERVICE_ACCOUNT_BASE64: " + err.message);
+    }
+}
+
+if (!process.env.FIREBASE_DATABASE_URL) {
+    console.error("Missing FIREBASE_DATABASE_URL in Environment Variables");
+    process.exit(1);
+}
+
+const serviceAccount = loadFirebaseServiceAccountFromEnv();
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    databaseURL:
-        "https://keyauthjms-default-rtdb.asia-southeast1.firebasedatabase.app/"
+    databaseURL: process.env.FIREBASE_DATABASE_URL
 });
 
 // ==========================================
@@ -242,6 +271,7 @@ app.post("/api/verify-license", limiter, async (req, res) => {
             licenseKey,
             hwid,
             tier,
+            middleCode,
             status: "active",
             appVersion: appVersion || "",
             ip: getClientIp(req),
@@ -371,7 +401,8 @@ app.post("/api/heartbeat", heartbeatLimiter, async (req, res) => {
         return res.json({
             action: "continue",
             payload: newToken,
-            tier: decoded.tier || sessionData.tier || "BASE"
+            tier: decoded.tier || sessionData.tier || "BASE",
+            middleCode: sessionData.middleCode || decoded.middleCode || ""
         });
     } catch (e) {
         console.error("Heartbeat Error:", e);
