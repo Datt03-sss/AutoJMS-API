@@ -2,6 +2,7 @@ const express = require("express");
 const admin = require("firebase-admin");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const fs = require("fs");
 const rateLimit = require("express-rate-limit");
 const NodeCache = require("node-cache");
 const helmet = require("helmet");
@@ -99,29 +100,29 @@ const SUPABASE_MANIFESTS = {
 // ==========================================
 // FIREBASE INIT
 // ==========================================
-function loadFirebaseServiceAccountFromEnv() {
-    const base64 = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64;
+function loadFirebaseServiceAccountFromFile() {
+    const filePath = process.env.FIREBASE_SERVICE_ACCOUNT_FILE;
 
-    if (!base64 || !base64.trim()) {
-        throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_BASE64 in Environment Variables");
+    if (!filePath || !filePath.trim()) {
+        throw new Error("Missing FIREBASE_SERVICE_ACCOUNT_FILE in Environment Variables");
     }
 
-    try {
-        const json = Buffer.from(base64, "base64").toString("utf8");
-        const serviceAccount = JSON.parse(json);
-
-        if (
-            !serviceAccount.project_id ||
-            !serviceAccount.client_email ||
-            !serviceAccount.private_key
-        ) {
-            throw new Error("Firebase service account env is missing required fields");
-        }
-
-        return serviceAccount;
-    } catch (err) {
-        throw new Error("Invalid FIREBASE_SERVICE_ACCOUNT_BASE64: " + err.message);
+    if (!fs.existsSync(filePath)) {
+        throw new Error(`FIREBASE_SERVICE_ACCOUNT_FILE not found: ${filePath}`);
     }
+
+    const json = fs.readFileSync(filePath, "utf8");
+    const serviceAccount = JSON.parse(json);
+
+    if (
+        !serviceAccount.project_id ||
+        !serviceAccount.client_email ||
+        !serviceAccount.private_key
+    ) {
+        throw new Error("Firebase service account file is missing required fields");
+    }
+
+    return serviceAccount;
 }
 
 if (!process.env.FIREBASE_DATABASE_URL) {
@@ -129,7 +130,10 @@ if (!process.env.FIREBASE_DATABASE_URL) {
     process.exit(1);
 }
 
-const serviceAccount = loadFirebaseServiceAccountFromEnv();
+const serviceAccount = loadFirebaseServiceAccountFromFile();
+
+console.log("[firebase] project_id:", serviceAccount.project_id);
+console.log("[firebase] database_url:", process.env.FIREBASE_DATABASE_URL);
 
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
