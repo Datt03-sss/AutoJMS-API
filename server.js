@@ -258,6 +258,31 @@ app.get("/health/firebase", async (req, res) => {
     }
 });
 
+app.get("/health/firebase/licenses", async (req, res) => {
+    const started = Date.now();
+
+    try {
+        const snap = await withTimeout(
+            admin.database().ref("Licenses").limitToFirst(1).once("value"),
+            FIREBASE_TIMEOUT_MS,
+            "FIREBASE_LICENSES_HEALTH_READ"
+        );
+
+        return res.json({
+            ok: true,
+            service: "firebase-licenses",
+            exists: snap.exists(),
+            elapsedMs: Date.now() - started
+        });
+    } catch (err) {
+        return res.status(503).json({
+            ok: false,
+            error: err.message,
+            elapsedMs: Date.now() - started
+        });
+    }
+});
+
 // ==========================================
 // API 1: VERIFY LICENSE
 // ==========================================
