@@ -250,10 +250,12 @@ function loadGoogleSheetsServiceAccount() {
         return googleSheetsServiceAccount;
     }
 
-    const filePath = process.env.GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE;
+    const filePath =
+        process.env.GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE ||
+        process.env.FIREBASE_SERVICE_ACCOUNT_FILE;
 
     if (!filePath || !filePath.trim()) {
-        throw new Error("Missing GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE in Environment Variables");
+        throw new Error("Missing GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE or FIREBASE_SERVICE_ACCOUNT_FILE in Environment Variables");
     }
 
     if (!fs.existsSync(filePath)) {
