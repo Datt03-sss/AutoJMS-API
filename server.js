@@ -3,12 +3,15 @@ const admin = require("firebase-admin");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const fs = require("fs");
+const { GoogleAuth } = require("google-auth-library");
 const rateLimit = require("express-rate-limit");
 const NodeCache = require("node-cache");
 const helmet = require("helmet");
 const cors = require("cors");
 
 const FIREBASE_TIMEOUT_MS = Number(process.env.FIREBASE_OPERATION_TIMEOUT_MS || 8000);
+const GOOGLE_SHEETS_GRANT_TIMEOUT_MS = Number(process.env.GOOGLE_SHEETS_GRANT_TIMEOUT_MS || 8000);
+const GOOGLE_SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets";
 const DEFAULT_SUPABASE_PROJECT_REF = "bnsnnrlwfzxemmizknwy";
 const DEFAULT_SUPABASE_BUCKET = "autojms-modules";
 
@@ -160,7 +163,14 @@ const heartbeatLimiter = rateLimit({
     max: 120
 });
 
+const googleSheetsGrantLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 60
+});
+
 const jtiCache = new NodeCache({ stdTTL: 3600 });
+let googleSheetsAuthClient = null;
+let googleSheetsServiceAccount = null;
 
 // ==========================================
 // HELPERS
@@ -225,6 +235,136 @@ function signAccessToken({ licenseKey, hwid, sessionId, tier }) {
             keyid: "accessKey"
         }
     );
+}
+
+function createPublicError(statusCode, error, message) {
+    const err = new Error(error);
+    err.statusCode = statusCode;
+    err.publicError = error;
+    err.publicMessage = message;
+    return err;
+}
+
+function loadGoogleSheetsServiceAccount() {
+    if (googleSheetsServiceAccount) {
+        return googleSheetsServiceAccount;
+    }
+
+    const filePath = process.env.GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE;
+
+    if (!filePath || !filePath.trim()) {
+        throw new Error("Missing GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE in Environment Variables");
+    }
+
+    if (!fs.existsSync(filePath)) {
+        throw new Error("GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE not found");
+    }
+
+    const json = fs.readFileSync(filePath, "utf8");
+    const serviceAccount = JSON.parse(json);
+
+    if (
+        !serviceAccount.project_id ||
+        !serviceAccount.client_email ||
+        !serviceAccount.private_key
+    ) {
+        throw new Error("Google Sheets service account file is missing required fields");
+    }
+
+    googleSheetsServiceAccount = serviceAccount;
+    console.log("[google-sheets] service account project_id:", serviceAccount.project_id);
+
+    return googleSheetsServiceAccount;
+}
+
+async function getGoogleSheetsAccessGrant() {
+    if (!googleSheetsAuthClient) {
+        const googleSheetsCredential = loadGoogleSheetsServiceAccount();
+        const auth = new GoogleAuth({
+            credentials: googleSheetsCredential,
+            scopes: [GOOGLE_SHEETS_SCOPE]
+        });
+
+        googleSheetsAuthClient = await withTimeout(
+            auth.getClient(),
+            GOOGLE_SHEETS_GRANT_TIMEOUT_MS,
+            "GOOGLE_SHEETS_AUTH_CLIENT"
+        );
+    }
+
+    const tokenResponse = await withTimeout(
+        googleSheetsAuthClient.getAccessToken(),
+        GOOGLE_SHEETS_GRANT_TIMEOUT_MS,
+        "GOOGLE_SHEETS_ACCESS_TOKEN"
+    );
+
+    const accessToken = typeof tokenResponse === "string"
+        ? tokenResponse
+        : tokenResponse?.token;
+
+    if (!accessToken) {
+        throw new Error("GOOGLE_SHEETS_ACCESS_TOKEN_EMPTY");
+    }
+
+    const expiryMs = Number(googleSheetsAuthClient.credentials?.expiry_date || 0);
+    const expiresAtMs = expiryMs > Date.now()
+        ? expiryMs
+        : Date.now() + 3600_000;
+
+    return {
+        accessToken,
+        expiresAt: new Date(expiresAtMs).toISOString(),
+        expiresInSeconds: Math.max(60, Math.floor((expiresAtMs - Date.now()) / 1000))
+    };
+}
+
+async function verifyLicenseTokenAndSession(req) {
+    const auth = req.headers.authorization || "";
+
+    if (!auth.startsWith("Bearer ")) {
+        throw createPublicError(401, "UNAUTHORIZED", "Missing license token.");
+    }
+
+    const token = auth.slice("Bearer ".length).trim();
+
+    if (!token) {
+        throw createPublicError(401, "UNAUTHORIZED", "Missing license token.");
+    }
+
+    let decoded;
+
+    try {
+        decoded = jwt.verify(token, CONFIG.PUBLIC, {
+            algorithms: ["RS256"],
+            issuer: CONFIG.ISSUER,
+            audience: CONFIG.AUDIENCE
+        });
+    } catch {
+        throw createPublicError(401, "UNAUTHORIZED", "Invalid or expired license token.");
+    }
+
+    const sessionRef = admin.database().ref(`sessions/${decoded.sid}`);
+    const snap = await withTimeout(
+        sessionRef.once("value"),
+        FIREBASE_TIMEOUT_MS,
+        "FIREBASE_GOOGLE_SHEETS_SESSION_READ"
+    );
+
+    if (!snap.exists()) {
+        throw createPublicError(401, "SESSION_NOT_FOUND", "License session was revoked.");
+    }
+
+    const sessionData = snap.val();
+
+    if (
+        sessionData.status !== "active" ||
+        sessionData.licenseKey !== decoded.key ||
+        sessionData.hwid !== decoded.hwid
+    ) {
+        throw createPublicError(401, "SESSION_INACTIVE", "License session is not active.");
+    }
+
+    return { decoded, sessionData };
 }
 
 // ==========================================
@@ -508,7 +648,100 @@ app.post("/api/verify-license", limiter, async (req, res) => {
 });
 
 // ==========================================
-// API 2: HEARTBEAT
+// API 2: GOOGLE SHEETS TOKEN BROKER
+// ==========================================
+app.post("/api/google-sheets/grant", googleSheetsGrantLimiter, async (req, res) => {
+    const requestId = crypto.randomUUID();
+    const started = Date.now();
+
+    try {
+        console.log(`[google-sheets-grant] start requestId=${requestId}`);
+
+        const { decoded } = await verifyLicenseTokenAndSession(req);
+        const maskedLicenseKey = maskLicenseKey(decoded.key);
+
+        const licenseSnap = await withTimeout(
+            admin.database().ref(`Licenses/${decoded.key}`).once("value"),
+            FIREBASE_TIMEOUT_MS,
+            "FIREBASE_GOOGLE_SHEETS_LICENSE_READ"
+        );
+
+        if (!licenseSnap.exists()) {
+            return res.status(404).json({
+                ok: false,
+                error: "LICENSE_NOT_FOUND",
+                message: "License key not found."
+            });
+        }
+
+        const licenseData = licenseSnap.val() || {};
+
+        if (licenseData.status !== "active") {
+            return res.status(403).json({
+                ok: false,
+                error: "LICENSE_INACTIVE",
+                message: "License key is inactive or locked."
+            });
+        }
+
+        const grant = await getGoogleSheetsAccessGrant();
+
+        console.log(
+            `[google-sheets-grant] success requestId=${requestId} license=${maskedLicenseKey} elapsedMs=${Date.now() - started}`
+        );
+
+        return res.json({
+            ok: true,
+            provider: "google-sheets-token-broker",
+            accessToken: grant.accessToken,
+            expiresAt: grant.expiresAt,
+            expiresInSeconds: grant.expiresInSeconds,
+            spreadsheetId: licenseData.dataSpreadsheetId || "",
+            scopes: [GOOGLE_SHEETS_SCOPE]
+        });
+    } catch (e) {
+        console.error(`[google-sheets-grant] error requestId=${requestId} elapsedMs=${Date.now() - started}`, {
+            error: e.message
+        });
+
+        if (isTimeoutError(e)) {
+            return res.status(503).json({
+                ok: false,
+                error: "GOOGLE_SHEETS_TIMEOUT",
+                message: "Google Sheets token broker timeout."
+            });
+        }
+
+        if (e.statusCode) {
+            return res.status(e.statusCode).json({
+                ok: false,
+                error: e.publicError || "GOOGLE_SHEETS_GRANT_FAILED",
+                message: e.publicMessage || "Google Sheets grant failed."
+            });
+        }
+
+        if (
+            String(e.message || "").includes("GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE") ||
+            String(e.message || "").toLowerCase().includes("service account") ||
+            String(e.message || "").includes("GOOGLE_SHEETS_ACCESS_TOKEN_EMPTY")
+        ) {
+            return res.status(503).json({
+                ok: false,
+                error: "GOOGLE_SHEETS_BROKER_UNAVAILABLE",
+                message: "Google Sheets token broker is not configured."
+            });
+        }
+
+        return res.status(500).json({
+            ok: false,
+            error: "GOOGLE_SHEETS_GRANT_FAILED",
+            message: "Google Sheets grant failed."
+        });
+    }
+});
+
+// ==========================================
+// API 3: HEARTBEAT
 // ==========================================
 app.post("/api/heartbeat", heartbeatLimiter, async (req, res) => {
     const requestId = crypto.randomUUID();
@@ -612,7 +845,7 @@ app.post("/api/heartbeat", heartbeatLimiter, async (req, res) => {
 });
 
 // ==========================================
-// API 3: LOGOUT SESSION
+// API 4: LOGOUT SESSION
 // ==========================================
 app.post("/api/logout", async (req, res) => {
     const requestId = crypto.randomUUID();
